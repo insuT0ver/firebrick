@@ -91,8 +91,8 @@ updated the network rules of my-project
 - The sandbox keeps its files, installed packages and Docker data, but it
   restarts: running processes stop, as after `fbk stop` and `fbk start`. A
   stopped sandbox stays stopped. A sandbox that already has the rules, or whose
-  rules aren't enforced, doesn't restart. A paused sandbox has to be resumed
-  first.
+  rules aren't enforced, doesn't restart. A paused sandbox can't be restarted,
+  and `fbk` has no resume command, so stop it with `fbk stop` first.
 - `fbk network` rewrites `.firebrick.yml`, which drops its comments and
   formatting.
 - `fbk network` sends the whole network section of `.firebrick.yml`, so it asks
