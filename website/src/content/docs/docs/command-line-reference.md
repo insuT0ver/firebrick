@@ -9,8 +9,9 @@ directory. `fbkd` takes no arguments besides `--help` and `--version`, which
 prints the daemon's version, for example `fbkd 0.9.0`.
 
 Run the commands from your project directory: Firebrick derives the sandbox from
-the working directory and its `.firebrick.yml`. `start`, `stop` and `rm` also
-take a sandbox name from `fbk ls` to manage another sandbox from any directory.
+the working directory and its `.firebrick.yml`. `start`, `stop`, `rm` and
+`upgrade` also take a sandbox name from `fbk ls` to manage another sandbox from
+any directory.
 
 `fbk --help` lists the commands, and `fbk <command> --help` describes one. `fbk
 --version` prints the installed version.
@@ -134,12 +135,13 @@ $ fbk upgrade
 Sandbox myproject-3f2a1c is already up to date (ghcr.io/wmeints/firebrick-base:v0.8.0)
 ```
 
-A paused sandbox has to be resumed or stopped first.
+A paused sandbox can't be upgraded. There's no resume command, so stop it with
+`fbk stop` first.
 
 When a sandbox still runs the `firebrick-base` image of an older Firebrick
-release, `fbk start`, `fbk run`, `fbk network allow|deny|enable|disable` and
-`fbk port forward|rm` warn about it and point to `fbk upgrade`, or to `fbk
-upgrade <name>` when you gave the command the sandbox's name. When
+release, `fbk start`, `fbk run`, every `fbk network` command that changes the
+settings and `fbk port forward|rm` warn about it and point to `fbk upgrade`, or
+to `fbk upgrade <name>` when you gave the command the sandbox's name. When
 `.firebrick.yml` names the old image, the warning asks you to change or remove
 `image` first, because `fbk upgrade` uses that image. The command still does its
 job. Sandboxes with another image never get the warning.
