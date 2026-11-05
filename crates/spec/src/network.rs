@@ -175,7 +175,7 @@ fn parse_cidr(address: &str, prefix: &str) -> Option<NetworkRule> {
 }
 
 /// Whether the value is a DNS host name: dot-separated labels of letters, digits and hyphens.
-fn is_host_name(value: &str) -> bool {
+pub(crate) fn is_host_name(value: &str) -> bool {
     value.len() <= 253 && value.split('.').all(is_host_label)
 }
 

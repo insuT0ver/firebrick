@@ -789,12 +789,12 @@ mod tests {
     #[test]
     fn network_spec_validates_proxy_from_rpc_clients() {
         let network = NetworkPolicy {
-            proxy: Some("http://127.0.0.1:3128".to_string()),
+            proxy: Some("http://proxy.example:3128".to_string()),
             ..Default::default()
         };
         assert_eq!(
             network_spec(Some(&network)).unwrap().proxy,
-            Some("http://127.0.0.1:3128".parse().unwrap())
+            Some("http://proxy.example:3128".parse().unwrap())
         );
         let invalid = NetworkPolicy {
             proxy: Some("http://user:password@127.0.0.1:3128".to_string()),

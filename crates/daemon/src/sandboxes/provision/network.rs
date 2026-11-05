@@ -3,14 +3,15 @@
 //! with TLS interception and an HTTP deny response that tells the user how to allow a blocked
 //! host.
 
-use firebrick_spec::{NetworkRule, NetworkSpec, ProxySpec};
+use firebrick_spec::{NetworkRule, NetworkSpec, ProxyEndpoint, ProxySpec};
 use microsandbox::MicrosandboxError;
 use microsandbox::sandbox::{SandboxBuilder, SandboxSpec};
 use microsandbox_network::config::HttpDenyResponseFormat;
 use microsandbox_network::policy::{
     Action, NetworkPolicy, Rule, RuleBuilder, RuleDestinationBuilder,
 };
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use url::Host;
 
 /// Body of the `403 Forbidden` response to a denied HTTP or HTTPS request. microsandbox
@@ -183,7 +184,7 @@ fn same_prefix(network: u128, ip: u128, prefix: u8, width: u32) -> bool {
 /// Adds the network settings to a sandbox that is being created. A disabled network removes
 /// the sandbox's network device and ignores the rules. Without `enforce`, the sandbox keeps
 /// microsandbox's default policy and no TLS interception.
-pub fn add_to_builder(
+pub async fn add_to_builder(
     builder: SandboxBuilder,
     network: &NetworkSpec,
 ) -> Result<SandboxBuilder, MicrosandboxError> {
@@ -191,7 +192,7 @@ pub fn add_to_builder(
         return Ok(builder.disable_network());
     }
 
-    let builder = with_proxy(builder, network.proxy.as_ref());
+    let builder = with_proxy(builder, network.proxy.as_ref()).await?;
 
     if !network.enforce {
         return Ok(builder);
@@ -211,15 +212,55 @@ pub fn add_to_builder(
 }
 
 /// Adds the host-side transport without replacing policy or TLS settings.
-fn with_proxy(builder: SandboxBuilder, proxy: Option<&ProxySpec>) -> SandboxBuilder {
-    match proxy {
-        Some(ProxySpec::HttpConnect(address)) => {
-            builder.proxy(|p| p.http_connect(address.to_string()))
-        }
-        Some(ProxySpec::Socks4(address)) => builder.proxy(|p| p.socks4(address.to_string())),
-        Some(ProxySpec::Socks5(address)) => builder.proxy(|p| p.socks5(address.to_string())),
-        None => builder,
+async fn with_proxy(
+    builder: SandboxBuilder,
+    proxy: Option<&ProxySpec>,
+) -> Result<SandboxBuilder, MicrosandboxError> {
+    let Some(proxy) = proxy else {
+        return Ok(builder);
+    };
+    let resolved = resolve_proxy_with(proxy, async {
+        tokio::net::lookup_host(proxy.endpoint().to_string())
+            .await
+            .map(Iterator::collect)
+    })
+    .await?;
+    Ok(match resolved {
+        ProxySpec::HttpConnect(address) => builder.proxy(|p| p.http_connect(address.to_string())),
+        ProxySpec::Socks4(address) => builder.proxy(|p| p.socks4(address.to_string())),
+        ProxySpec::Socks5(address) => builder.proxy(|p| p.socks5(address.to_string())),
+    })
+}
+
+/// Resolves the proxy on the host, bounded in time, and never falls back to a direct transport.
+async fn resolve_proxy_with(
+    proxy: &ProxySpec,
+    lookup: impl std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+) -> Result<ProxySpec, MicrosandboxError> {
+    if matches!(proxy.endpoint(), ProxyEndpoint::Ip(_)) {
+        return Ok(proxy.clone());
     }
+    let error = |reason| {
+        MicrosandboxError::InvalidConfig(format!(
+            "cannot resolve network.proxy endpoint {} on the host: {reason}",
+            proxy.endpoint()
+        ))
+    };
+    let addresses = tokio::time::timeout(Duration::from_secs(5), lookup)
+        .await
+        .map_err(|_| error("DNS lookup timed out".to_string()))?
+        .map_err(|err| error(err.to_string()))?;
+    let address = select_proxy_address(proxy, addresses)
+        .ok_or_else(|| error("no usable address (SOCKS4 requires IPv4)".to_string()))?;
+    Ok(proxy.with_address(address))
+}
+
+/// Prefer IPv4 when both families are returned; SOCKS4 requires it.
+fn select_proxy_address(proxy: &ProxySpec, addresses: Vec<SocketAddr>) -> Option<SocketAddr> {
+    addresses
+        .into_iter()
+        .filter(|address| !proxy.requires_ipv4() || address.is_ipv4())
+        .min_by_key(|address| address.is_ipv6())
 }
 
 /// Returns the policy that enforces the rules: all deny rules, then all allow rules, then DNS
@@ -277,6 +318,94 @@ mod tests {
             assert_eq!(rules_from_label(&rules_label(&network)), Some(network));
         }
         assert!(rules_from_label("off;proxy=http://user:password@127.0.0.1:3128").is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_hostname_resolution_prefers_ipv4_and_preserves_protocol() {
+        let proxy: ProxySpec = "socks5://proxy.internal:1080".parse().unwrap();
+        let resolved = resolve_proxy_with(
+            &proxy,
+            std::future::ready(Ok(vec![
+                "[::1]:1080".parse().unwrap(),
+                "127.0.0.1:1080".parse().unwrap(),
+            ])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.to_string(), "socks5://127.0.0.1:1080");
+        assert_eq!(proxy.to_string(), "socks5://proxy.internal:1080");
+    }
+
+    #[tokio::test]
+    async fn proxy_dns_failure_returns_an_error_instead_of_a_direct_transport() {
+        let proxy: ProxySpec = "http://proxy.invalid:3128".parse().unwrap();
+        let error = resolve_proxy_with(
+            &proxy,
+            std::future::ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "DNS unavailable",
+            ))),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("proxy.invalid:3128"));
+        assert!(error.to_string().contains("DNS unavailable"));
+    }
+
+    #[tokio::test]
+    async fn socks4_proxy_hostname_requires_an_ipv4_answer() {
+        let proxy: ProxySpec = "socks4://proxy.internal:1080".parse().unwrap();
+        let error = resolve_proxy_with(
+            &proxy,
+            std::future::ready(Ok(vec!["[::1]:1080".parse().unwrap()])),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("SOCKS4 requires IPv4"));
+    }
+
+    #[tokio::test]
+    async fn literal_proxy_address_does_not_need_dns() {
+        let proxy: ProxySpec = "http://127.0.0.1:3128".parse().unwrap();
+        let resolved = resolve_proxy_with(&proxy, std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(resolved, proxy);
+    }
+
+    #[tokio::test]
+    async fn proxy_dns_timeout_returns_an_error() {
+        let proxy: ProxySpec = "http://proxy.internal:3128".parse().unwrap();
+        let error = resolve_proxy_with(&proxy, std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("DNS lookup timed out"));
+    }
+
+    #[tokio::test]
+    async fn proxy_hostname_can_resolve_to_ipv6_only_for_http_connect() {
+        let proxy: ProxySpec = "http://proxy.internal:3128".parse().unwrap();
+        let lookup = std::future::ready(Ok(vec!["[::1]:3128".parse().unwrap()]));
+        let resolved = resolve_proxy_with(&proxy, lookup).await.unwrap();
+        assert_eq!(resolved.to_string(), "http://[::1]:3128");
+    }
+
+    #[tokio::test]
+    async fn localhost_proxy_is_resolved_before_building_the_sandbox_config() {
+        let network = NetworkSpec {
+            proxy: Some("http://localhost:3128".parse().unwrap()),
+            ..NetworkSpec::default()
+        };
+        let config = config_with(&network, &[]).await;
+        let json = serde_json::to_value(&config.spec.network).unwrap();
+        let address: SocketAddr = json["outbound_proxy"]["address"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(address.ip().is_loopback());
+        assert_eq!(address.port(), 3128);
+        assert_eq!(rules_from_label(&rules_label(&network)), Some(network));
     }
 
     #[test]
@@ -346,7 +475,7 @@ mod tests {
     /// secrets.
     async fn config_with(network: &NetworkSpec, secrets: &[Secret]) -> SandboxConfig {
         let builder = Sandbox::builder("fbk-unit-network").image("alpine");
-        let builder = add_to_builder(builder, network).unwrap();
+        let builder = add_to_builder(builder, network).await.unwrap();
 
         crate::secrets::add_to_builder(builder, secrets)
             .build()

@@ -11,17 +11,90 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxySpec {
     /// TCP tunnels opened with HTTP CONNECT.
-    HttpConnect(SocketAddr),
+    HttpConnect(ProxyEndpoint),
     /// SOCKS4 TCP proxy, without a user ID.
-    Socks4(SocketAddr),
+    Socks4(ProxyEndpoint),
     /// SOCKS5 proxy, without authentication.
-    Socks5(SocketAddr),
+    Socks5(ProxyEndpoint),
+}
+
+/// A numeric endpoint or a DNS name resolved by fbkd when it creates the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyEndpoint {
+    /// An IPv4 address, or bracketed IPv6 address, with its port.
+    Ip(SocketAddr),
+    /// An ASCII DNS name and an explicit, nonzero port.
+    Hostname { host: String, port: u16 },
+}
+
+impl FromStr for ProxyEndpoint {
+    type Err = InvalidProxy;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Ok(address) = value.parse::<SocketAddr>() {
+            return (address.port() != 0)
+                .then_some(Self::Ip(address))
+                .ok_or(InvalidProxy);
+        }
+        let (host, port) = value.rsplit_once(':').ok_or(InvalidProxy)?;
+        let name = host.strip_suffix('.').unwrap_or(host);
+        if !crate::network::is_host_name(name)
+            || name.chars().all(|c| c.is_ascii_digit() || c == '.')
+            || port.is_empty()
+            || !port.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(InvalidProxy);
+        }
+        let port: u16 = port.parse().map_err(|_| InvalidProxy)?;
+        if port == 0 {
+            return Err(InvalidProxy);
+        }
+        Ok(Self::Hostname {
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+}
+
+impl fmt::Display for ProxyEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ip(address) => write!(f, "{address}"),
+            Self::Hostname { host, port } => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
+impl ProxySpec {
+    /// The endpoint, before host-side name resolution.
+    pub fn endpoint(&self) -> &ProxyEndpoint {
+        match self {
+            Self::HttpConnect(endpoint) | Self::Socks4(endpoint) | Self::Socks5(endpoint) => {
+                endpoint
+            }
+        }
+    }
+
+    /// Whether this proxy transport requires an IPv4 endpoint.
+    pub fn requires_ipv4(&self) -> bool {
+        matches!(self, Self::Socks4(_))
+    }
+
+    /// Keeps the protocol and replaces its endpoint with a resolved socket address.
+    pub fn with_address(&self, address: SocketAddr) -> Self {
+        let endpoint = ProxyEndpoint::Ip(address);
+        match self {
+            Self::HttpConnect(_) => Self::HttpConnect(endpoint),
+            Self::Socks4(_) => Self::Socks4(endpoint),
+            Self::Socks5(_) => Self::Socks5(endpoint),
+        }
+    }
 }
 
 /// Invalid proxy input. Deliberately excludes the input, which might contain credentials.
 #[derive(Debug, Clone, Copy, Error)]
 #[error(
-    "invalid network.proxy: use http://IP:port, socks4://IP:port or socks5://IP:port without credentials, a path or a query; the port must be nonzero"
+    "invalid network.proxy: use http://host:port, socks4://host:port or socks5://host:port; host must be an ASCII DNS name or IP address (bracket IPv6); use a nonzero port and no credentials, path, query or fragment; SOCKS4 requires IPv4"
 )]
 pub struct InvalidProxy;
 
@@ -30,13 +103,12 @@ impl FromStr for ProxySpec {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let (scheme, address) = value.split_once("://").ok_or(InvalidProxy)?;
-        let address: SocketAddr = address.parse().map_err(|_| InvalidProxy)?;
-        if address.port() == 0 {
-            return Err(InvalidProxy);
-        }
+        let address: ProxyEndpoint = address.parse()?;
         match scheme {
             "http" => Ok(Self::HttpConnect(address)),
-            "socks4" if address.is_ipv4() => Ok(Self::Socks4(address)),
+            "socks4" if !matches!(&address, ProxyEndpoint::Ip(ip) if ip.is_ipv6()) => {
+                Ok(Self::Socks4(address))
+            }
             "socks5" => Ok(Self::Socks5(address)),
             _ => Err(InvalidProxy),
         }
@@ -72,7 +144,7 @@ impl Visitor<'_> for ProxyVisitor {
     type Value = ProxySpec;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a proxy URL with an IP address and port")
+        formatter.write_str("a proxy URL with a DNS name or IP address and an explicit port")
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
@@ -92,6 +164,10 @@ mod tests {
             "http://[::1]:3128",
             "socks4://192.168.1.10:1080",
             "socks5://[::1]:1080",
+            "http://proxy.example:3128",
+            "socks4://proxy.internal:1080",
+            "socks5://localhost:1080",
+            "http://proxy.example.:3128",
         ] {
             let spec: NetworkSpec = serde_yaml::from_str(&format!("proxy: {url}\n")).unwrap();
             assert_eq!(spec.proxy.as_ref().unwrap().to_string(), url);
@@ -107,7 +183,13 @@ mod tests {
             "",
             "127.0.0.1:3128",
             "https://127.0.0.1:3128",
-            "http://proxy.example:3128",
+            "http://proxy.example",
+            "http://proxy.example:0",
+            "http://-proxy.example:3128",
+            "http://proxy..example:3128",
+            "http://proxy.example:3128#fragment",
+            "http://999.999.999.999:3128",
+            "http://user:secret@proxy.example:3128",
             "http://127.0.0.1:0",
             "http://127.0.0.1",
             "http://127.0.0.1:3128/",
@@ -123,6 +205,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn hostname_case_is_normalized_without_resolving_it() {
+        let proxy: ProxySpec = "http://Proxy.Example:3128".parse().unwrap();
+        assert_eq!(proxy.to_string(), "http://proxy.example:3128");
+        assert!(
+            matches!(proxy.endpoint(), ProxyEndpoint::Hostname { host, port }
+            if host == "proxy.example" && *port == 3128)
+        );
     }
 
     #[test]

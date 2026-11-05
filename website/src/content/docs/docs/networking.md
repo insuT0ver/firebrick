@@ -67,26 +67,34 @@ host. Programs in the sandbox need no `HTTP_PROXY` or `HTTPS_PROXY` variables:
 ```yaml
 name: my-project
 network:
-  proxy: "http://127.0.0.1:3128"
-  enforce: true
-  allow:
-    - "*.github.com"
-    - api.anthropic.com
+  proxy: "http://proxy.example.com:3128"
+  enforce: false
 ```
 
 `http://` uses HTTP CONNECT tunnels, including for plain TCP connections. The
 proxy must allow CONNECT to the destination IP and port; a proxy that only
 allows CONNECT on port 443 won't carry HTTP on port 80.
-`socks4://127.0.0.1:1080` and `socks5://127.0.0.1:1080` are supported too. Use a
-literal IP address and a nonzero port; bracket IPv6 addresses, as in
-`http://[::1]:3128`. SOCKS4 only supports IPv4 proxy addresses. Hostnames,
-authentication, HTTPS connections to the proxy, paths, queries and
-per-destination bypasses aren't supported yet.
+`socks4://proxy.example.com:1080` and `socks5://proxy.example.com:1080` are
+supported too. Use an ASCII DNS name or a literal IP address and an explicit,
+nonzero port; bracket IPv6 addresses, as in `http://[::1]:3128`. SOCKS4 requires
+an IPv4 address or a hostname with an IPv4 answer. Authentication, HTTPS
+connections to the proxy, paths, queries and per-destination bypasses aren't
+supported yet.
+
+`fbkd` resolves proxy hostnames with the host's resolver when the sandbox is
+created or recreated, including for a network change or image upgrade. The
+guest's DNS settings aren't used for that lookup. IPv4 is preferred when both
+address families are returned. One address is selected for that sandbox; there
+is no per-connection DNS refresh or automatic retry of other proxy addresses. A
+lookup failure or a five-second timeout fails the operation instead of falling
+back to a direct connection. The original hostname stays in the spec, settings
+review and stored network label.
 
 The address is relative to the host: `127.0.0.1` means the machine running
 `fbkd`, not the sandbox. The proxy itself doesn't need an `allow` rule; the
 rules still apply to the original destinations. The proxy applies even when
-`enforce` is false. `network.enabled: false` still takes the sandbox offline.
+`enforce` is false. Leave it false when the external proxy should do the
+destination filtering. `network.enabled: false` still takes the sandbox offline.
 Adding, changing or removing a proxy is included in the normal settings review.
 
 For an existing sandbox, edit the file and run `fbk network policy enable` (or

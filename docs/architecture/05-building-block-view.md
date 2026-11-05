@@ -236,6 +236,12 @@ alongside the policy, so updates detect proxy changes and image upgrades
 preserve it. See
 [ADR 0058](decisions/0058-use-microsandbox-outbound-proxies.md).
 
+Proxy endpoints may be numeric or ASCII DNS names. The daemon resolves names
+asynchronously through the host resolver before handing a numeric address to
+microsandbox. Resolution has a five-second timeout and errors never select a
+direct transport. The original hostname remains in the label for subsequent
+recreations; an already running sandbox keeps its selected IP address.
+
 The daemon has eight top-level modules. Each one hides its submodules behind a
 narrow interface, such as `SandboxManager` for `sandboxes` and `sync` for
 `host_config`.

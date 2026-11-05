@@ -17,9 +17,15 @@ capability without implementing a second proxy transport.
 
 Expose an optional `network.proxy` URL in `.firebrick.yml`, carry it over the
 existing network RPC and validate it at both the CLI and daemon boundaries.
-Initially accept literal IP addresses with nonzero ports and no credentials.
-Reuse microsandbox's proxy builder for transport, including its behavior on
-connection failures and its existing policy and TLS processing.
+Accept literal IP addresses or ASCII DNS names with nonzero ports and no
+credentials. Resolve names asynchronously using the host resolver when creating
+or recreating the sandbox, with a five-second timeout. Prefer IPv4 and require
+it for SOCKS4. Pass the selected numeric endpoint to microsandbox, while
+retaining the hostname in settings review and the stored label. DNS failures
+fail the operation and never select a direct transport. Running sandboxes retain
+their selected address. Reuse microsandbox's proxy builder for transport,
+including its behavior on connection failures and its existing policy and TLS
+processing.
 
 Include proxy additions, replacements and removals in settings review. Keep the
 proxy in the stored network label even when enforcement or networking is off, so
@@ -31,8 +37,8 @@ proxy retain their existing representation.
 Tools need no proxy variables and cannot bypass the selected TCP proxy merely by
 ignoring environment variables. This does not route DNS, image pulls or all
 host-side activity through the proxy. HTTP CONNECT and SOCKS4 don't carry
-non-DNS UDP; SOCKS5 can. Authentication, hostname resolution for the proxy,
-custom CA configuration and destination bypasses need separate follow-up work.
+non-DNS UDP; SOCKS5 can. Authentication, custom CA configuration, proxy address
+failover and destination bypasses need separate follow-up work.
 
 Tests cover config and RPC validation, settings review, label round trips and
 the generated microsandbox config. A VM smoke test must additionally verify
