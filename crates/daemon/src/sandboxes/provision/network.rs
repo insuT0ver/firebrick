@@ -293,9 +293,8 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_is_passed_to_microsandbox_independently_of_enforcement() {
-        for enforce in [false, true] {
-            assert_proxy_config(enforce).await;
-        }
+        assert_proxy_config(false).await;
+        assert_proxy_config(true).await;
     }
 
     async fn assert_proxy_config(enforce: bool) {
