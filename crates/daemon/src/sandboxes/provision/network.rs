@@ -3,7 +3,7 @@
 //! with TLS interception and an HTTP deny response that tells the user how to allow a blocked
 //! host.
 
-use firebrick_spec::{NetworkRule, NetworkSpec};
+use firebrick_spec::{NetworkRule, NetworkSpec, ProxySpec};
 use microsandbox::MicrosandboxError;
 use microsandbox::sandbox::{SandboxBuilder, SandboxSpec};
 use microsandbox_network::config::HttpDenyResponseFormat;
@@ -27,6 +27,15 @@ pub const RULES_LABEL: &str = "firebrick.network";
 /// its rules, so it is recorded as `disabled`. Rules that aren't enforced don't change the
 /// sandbox, so they are all recorded as `off`.
 pub fn rules_label(network: &NetworkSpec) -> String {
+    let rules = policy_label(network);
+    match &network.proxy {
+        Some(proxy) => format!("{rules};proxy={proxy}"),
+        None => rules,
+    }
+}
+
+/// Records the effective policy separately from the proxy, including when policy is off.
+fn policy_label(network: &NetworkSpec) -> String {
     if !network.is_enabled() {
         return "disabled".to_string();
     }
@@ -70,6 +79,17 @@ pub fn rules_of(spec: &SandboxSpec) -> NetworkSpec {
 /// and enforced without rules, so it allows no host. Returns `None` for a value that
 /// [`rules_label`] can't have written.
 pub fn rules_from_label(value: &str) -> Option<NetworkSpec> {
+    let (value, proxy) = match value.split_once(";proxy=") {
+        Some((rules, proxy)) => (rules, Some(proxy.parse().ok()?)),
+        None => (value, None),
+    };
+    let mut network = policy_from_label(value)?;
+    network.proxy = proxy;
+    Some(network)
+}
+
+/// Reads the policy portion, accepting labels written before outbound proxies existed.
+fn policy_from_label(value: &str) -> Option<NetworkSpec> {
     match value {
         "off" => return Some(NetworkSpec::default()),
         "disabled" => {
@@ -171,6 +191,8 @@ pub fn add_to_builder(
         return Ok(builder.disable_network());
     }
 
+    let builder = with_proxy(builder, network.proxy.as_ref());
+
     if !network.enforce {
         return Ok(builder);
     }
@@ -186,6 +208,18 @@ pub fn add_to_builder(
                 .deny_message(DENY_MESSAGE)
         })
     }))
+}
+
+/// Adds the host-side transport without replacing policy or TLS settings.
+fn with_proxy(builder: SandboxBuilder, proxy: Option<&ProxySpec>) -> SandboxBuilder {
+    match proxy {
+        Some(ProxySpec::HttpConnect(address)) => {
+            builder.proxy(|p| p.http_connect(address.to_string()))
+        }
+        Some(ProxySpec::Socks4(address)) => builder.proxy(|p| p.socks4(address.to_string())),
+        Some(ProxySpec::Socks5(address)) => builder.proxy(|p| p.socks5(address.to_string())),
+        None => builder,
+    }
 }
 
 /// Returns the policy that enforces the rules: all deny rules, then all allow rules, then DNS
@@ -231,6 +265,59 @@ mod tests {
     use crate::secrets::Secret;
     use microsandbox::sandbox::{Sandbox, SandboxConfig};
     use microsandbox_network::policy::{Destination, Direction};
+
+    #[test]
+    fn proxy_labels_round_trip_with_and_without_enforcement() {
+        for enforce in [false, true] {
+            let network = NetworkSpec {
+                enforce,
+                proxy: Some("http://127.0.0.1:3128".parse().unwrap()),
+                ..NetworkSpec::default()
+            };
+            assert_eq!(rules_from_label(&rules_label(&network)), Some(network));
+        }
+        assert!(rules_from_label("off;proxy=http://user:password@127.0.0.1:3128").is_none());
+    }
+
+    #[test]
+    fn disabled_network_remembers_its_proxy_for_image_upgrades() {
+        let network = NetworkSpec {
+            enabled: Some(false),
+            proxy: Some("http://127.0.0.1:3128".parse().unwrap()),
+            ..NetworkSpec::default()
+        };
+        let restored = rules_from_label(&rules_label(&network)).unwrap();
+        assert!(!restored.is_enabled());
+        assert_eq!(restored.proxy, network.proxy);
+    }
+
+    #[tokio::test]
+    async fn proxy_is_passed_to_microsandbox_independently_of_enforcement() {
+        for enforce in [false, true] {
+            assert_proxy_config(enforce).await;
+        }
+    }
+
+    async fn assert_proxy_config(enforce: bool) {
+        for (url, protocol) in [
+            ("http://127.0.0.1:3128", "http_connect"),
+            ("socks4://127.0.0.1:1080", "socks4"),
+            ("socks5://127.0.0.1:1080", "socks5"),
+        ] {
+            let network = NetworkSpec {
+                enforce,
+                proxy: Some(url.parse().unwrap()),
+                ..NetworkSpec::default()
+            };
+            let config = config_with(&network, &[]).await;
+            let json = serde_json::to_value(&config.spec.network).unwrap();
+            assert_eq!(json["outbound_proxy"]["protocol"], protocol);
+            assert_eq!(
+                json["outbound_proxy"]["address"],
+                url.split_once("://").unwrap().1
+            );
+        }
+    }
 
     fn rules(values: &[&str]) -> Vec<NetworkRule> {
         values.iter().map(|value| value.parse().unwrap()).collect()

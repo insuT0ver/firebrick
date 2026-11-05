@@ -5,6 +5,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use crate::ProxySpec;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::result::Result;
@@ -28,6 +29,9 @@ pub struct NetworkSpec {
     /// Destinations the sandbox may not connect to, even when an `allow` rule matches them.
     #[serde(default)]
     pub deny: Vec<NetworkRule>,
+    /// Host-side proxy, applied independently of policy enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxySpec>,
 }
 
 impl NetworkSpec {
